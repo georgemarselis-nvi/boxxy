@@ -87,6 +87,49 @@ impl FsDriver {
             Err(e) => Err(e.into()),
         }
     }
+
+    pub fn fully_expand_path(&self, path: &String) -> Result<PathBuf> {
+        let expanded = shellexpand::tilde(&path).to_string();
+        match Path::new(&expanded).canonicalize() {
+            Ok(path) => match self.maybe_resolve_symlink(&path) {
+                Ok(path) => match path.canonicalize() {
+                    Ok(canonical_path) => Ok(canonical_path),
+                    Err(_) => Ok(path),
+                },
+                err @ Err(_) => err,
+            },
+            Err(_) => {
+                // If the path doesn't exist, we'll create it
+                Ok(PathBuf::from(&expanded))
+            }
+        }
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    pub fn maybe_resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
+        Self::do_resolve_symlink(path, 0)
+    }
+
+    fn do_resolve_symlink(path: &Path, depth: u32) -> Result<PathBuf> {
+        if depth > 10 {
+            return Err(color_eyre::eyre::eyre!(
+                "Too many symlinks when resolving path: {:?}",
+                path
+            ));
+        }
+
+        let path = if path.is_symlink() {
+            path.read_link()?.canonicalize()?
+        } else {
+            path.to_path_buf()
+        };
+
+        if path.is_symlink() {
+            return Self::do_resolve_symlink(&path, depth + 1);
+        }
+
+        Ok(path)
+    }
 }
 
 pub fn append_all<P: AsRef<Path>>(buf: &Path, parts: Vec<P>) -> PathBuf {

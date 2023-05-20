@@ -3,6 +3,8 @@
 boxxy is a tool for boxing up misbehaving Linux applications and forcing them
 to put their files and directories in the right place, **without symlinks!**
 
+boxxy is a part of the [amyware discord server](https://discord.gg/7WgSTwh).
+
 Linux-only! boxxy uses Linux namespaces for its functionality.
 
 For example, consider tmux. It wants to put its config in `~/.tmux.conf`. With
@@ -33,6 +35,17 @@ force it to puts its data somewhere nice and proper.
 - minimal overhead
 - opt-in immutable fs outside of rule rewrites, ie only the files/directories
   you specify in rules are writable
+- `0.5.0`: boxxy can scan your homedir to automatically suggest rules for
+  you! ![image of boxxy scan](https://cdn.mewna.xyz/2023/03/25/G6hrd3iQjEy65.png)
+- `0.6.0`: boxxy can use project-local `boxxy.yaml` files, and can load
+  `.env` files for you! ![image of 0.6.0 features](https://cdn.mewna.xyz/2023/03/28/Jawp5It1xrnWN.png)
+- `0.6.1`: boxxy rules can inject env vars: ![image of 0.6.1 features](https://cdn.mewna.xyz/2023/03/29/ukcWuiYdtI8yq.png)
+
+### potential drawbacks
+
+- new project, 0.x.y, comes with all those warnings
+- **cannot** use sudo inside the container (see [#6](https://github.com/queer/boxxy/issues/6))
+- primarily tested for my use-cases
 
 ## example usage
 
@@ -68,6 +81,7 @@ git:(mistress) | ▶
 - use contexts to keep project configs separate on disk
 - dotfiles!
 - stop using symlinks!!!
+- no more dev config files when writing code
 
 ## configuration
 
@@ -116,6 +130,8 @@ rules:
   only: # optional
   - "binary name"
   - "binary name"
+  env: # optional
+    KEY: "value"
 ```
 
 ## developing

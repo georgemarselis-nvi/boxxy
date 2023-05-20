@@ -1,15 +1,19 @@
-use std::fs;
-use std::process::Command;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use atty::Stream;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
-use config::{Config, FileFormat};
 use log::*;
+use scanner::App;
 
-use crate::enclosure::rule::Rules;
+use crate::config::BoxxyConfig;
+use crate::enclosure::rule::{BoxxyRules, Rule, RuleMode};
+use crate::scanner::Scanner;
 
+pub mod config;
 pub mod enclosure;
+pub mod scanner;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -20,6 +24,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     about = "Put bad programs in a box with only their files.",
     long_about = "boxxy forces bad programs to put their files somewhere else via Linux user namespaces.",
     version = VERSION,
+    subcommand_negates_reqs = true,
 )]
 pub struct Args {
     #[arg(
@@ -29,6 +34,7 @@ pub struct Args {
         help = "Make the root filesystem immutable."
     )]
     pub immutable_root: bool,
+
     #[arg(
         trailing_var_arg = true,
         name = "COMMAND TO RUN",
@@ -36,51 +42,95 @@ pub struct Args {
         help = "The command to run, ex. `ls -lah` or `aws configure`."
     )]
     pub command_with_args: Vec<String>,
+
     #[arg(short = 'l', long = "log-level", default_value = "info")]
     pub log_level: String,
+
     #[arg(
         long = "force-colour",
         default_value = "false",
         help = "Force colour output even when stdout is not a tty."
     )]
     pub force_colour: bool,
+
+    #[arg(
+        short = 't',
+        long = "trace",
+        default_value = "false",
+        help = "Enable tracing of I/O-related syscalls and generate a report of files/directories the program touched."
+    )]
+    pub trace: bool,
+
+    #[arg(
+        short = 'd',
+        long = "dotenv",
+        default_value = "false",
+        help = "Load environment variables from the .env file in the current directory and apply them to the boxxed program."
+    )]
+    pub dotenv: bool,
+
+    #[command(subcommand)]
+    pub command: Option<BoxxySubcommand>,
+}
+
+#[derive(Subcommand)]
+pub enum BoxxySubcommand {
+    #[command(
+        name = "config",
+        about = "View the config file.",
+        subcommand_negates_reqs = true,
+        aliases = &["cfg", "conf", "c"]
+    )]
+    Config,
+    #[command(
+        name = "scan",
+        about = "Scan your homedir for applications that may benefit from boxxy.",
+        subcommand_negates_reqs = true,
+        aliases = &["s"]
+    )]
+    Scan,
 }
 
 fn main() -> Result<()> {
     // Fetch command to run
     let cfg = Args::parse();
-    let self_exe = std::env::args().next().unwrap();
-    setup_logging(&cfg, &self_exe)?;
+    setup_logging(&cfg)?;
 
-    // Load rules
-    let rules = load_rules(&self_exe)?;
-    info!("loaded {} rules", rules.rules.len());
-
-    // Do the do!
-    let (cmd, args) = (&cfg.command_with_args[0], &cfg.command_with_args[1..]);
-    let mut command = Command::new(cmd);
-
-    // Pass through current env
-    command.envs(std::env::vars());
-
-    // Pass args
-    if !args.is_empty() {
-        command.args(args);
+    if let Some(cmd) = cfg.command {
+        match cmd {
+            BoxxySubcommand::Config => {
+                for config_path in BoxxyConfig::rule_paths()? {
+                    let mut printer = bat::PrettyPrinter::new();
+                    printer.input_file(config_path).print()?;
+                }
+                return Ok(());
+            }
+            BoxxySubcommand::Scan => {
+                let apps = Scanner::new().scan()?;
+                return scan_homedir(apps);
+            }
+        }
     }
 
+    // Load rules
+    let rules = {
+        let mut rules = vec![];
+        for config in BoxxyConfig::rule_paths()? {
+            info!("loading rules from {}", config.display());
+            rules.push(BoxxyConfig::load_rules_from_path(&config)?);
+        }
+        BoxxyConfig::merge(rules)
+    };
+    info!("loaded {} total rule(s)", rules.rules.len());
+
     // Do the thing!
-    enclosure::Enclosure::new(enclosure::Opts {
-        rules,
-        command: &mut command,
-        immutable_root: cfg.immutable_root,
-    })
-    .run()?;
+    enclosure::Enclosure::new(BoxxyConfig::load_config(cfg)?).run()?;
 
     Ok(())
 }
 
-fn setup_logging(cfg: &Args, self_exe: &str) -> Result<()> {
-    if self_exe.starts_with("target/debug") {
+fn setup_logging(cfg: &Args) -> Result<()> {
+    if BoxxyConfig::debug_mode()? {
         // If no debug set up, basic debugging in dev
         if std::env::var("RUST_DEBUG").is_err() {
             std::env::set_var("RUST_DEBUG", "1");
@@ -92,7 +142,7 @@ fn setup_logging(cfg: &Args, self_exe: &str) -> Result<()> {
         std::env::set_var("RUST_LOG", &cfg.log_level);
     }
 
-    if atty::isnt(Stream::Stdin) && !cfg.force_colour {
+    if atty::isnt(Stream::Stdout) && !cfg.force_colour {
         // Disable user-friendliness if we're not outputting to a terminal.
         std::env::set_var("NO_COLOR", "1");
         std::env::set_var("RUST_LOG", "warn");
@@ -104,52 +154,63 @@ fn setup_logging(cfg: &Args, self_exe: &str) -> Result<()> {
         .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
         .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
         .install()?;
+
     pretty_env_logger::init();
 
     Ok(())
 }
 
-fn load_rules(self_exe: &str) -> Result<Rules> {
-    // Set up config file
-    let config_file = if self_exe.starts_with("target/debug") {
-        "boxxy-dev.yaml"
-    } else {
-        "boxxy.yaml"
-    };
-    debug!("loading config: {}", config_file);
-    let config_path =
-        crate::enclosure::fs::append_all(&dirs::config_dir().unwrap(), vec!["boxxy", config_file]);
-    fs::create_dir_all(config_path.parent().unwrap())?;
-    if !config_path.exists() {
-        info!("no config file found!");
-        fs::write(&config_path, "rules: []")?;
-        info!("created empty config at {}", config_path.display());
+fn scan_homedir(apps: Vec<App>) -> Result<()> {
+    if !apps.is_empty() {
+        info!(
+            "found {} applications that might be boxxable! generating config...",
+            apps.len()
+        );
+        let mut rules = vec![];
+        for app in apps {
+            for fix in app.fixes {
+                let (old, new) = fix.split_once(':').unwrap();
+                let path = PathBuf::from(old);
+                let mode = if path.is_dir() {
+                    RuleMode::Directory
+                } else {
+                    RuleMode::File
+                };
+                rules.push(Rule {
+                    name: app.name.clone(),
+                    target: old.into(),
+                    rewrite: new.into(),
+                    mode,
+                    context: vec![],
+                    only: vec![],
+                    // TODO: populate for apps where possible
+                    env: HashMap::new(),
+                });
+            }
+        }
+        let config = BoxxyRules {
+            rules: rules.clone(),
+        };
+        let config = &serde_yaml::to_string(&config)?;
+        let mut printer = bat::PrettyPrinter::new();
+        println!();
+        printer
+            .input_from_bytes(config.as_bytes())
+            .language("yaml")
+            .print()
+            .expect("failed to print config");
+        println!();
+        warn!("!!! BE CAREFUL WITH THIS CONFIG !!!");
+        warn!("SAFETY IS NOT GUARANTEED!!!");
+        warn!("this config was automatically generated and may not be correct.");
+        warn!("please review the config before using it!");
+        warn!("report bad rules!! https://github.com/queer/boxxy/issues/new");
+        info!("rules generated: {}", rules.len());
+        info!(
+            "put relevant rules in your config file: {}",
+            BoxxyConfig::default_config_path()?.display()
+        );
     }
 
-    // Load rules from config
-    let rules = if fs::metadata(&config_path)?.len() > 0 {
-        let config = Config::builder()
-            .add_source(config::File::new(
-                &config_path.as_path().to_string_lossy(),
-                FileFormat::Yaml,
-            ))
-            .build()?;
-        config.try_deserialize::<Rules>()?
-    } else {
-        warn!("you have no rules in your config file.");
-        warn!("try adding some rules to {config_path:?}");
-        warn!(
-            r#"
-example rule:
-
-    rules:
-    - name: "make aws cli write to ~/.config/aws"
-      target: "~/.aws"
-      rewrite: "~/.config/aws"
-        "#
-        );
-        Rules { rules: vec![] }
-    };
-
-    Ok(rules)
+    Ok(())
 }

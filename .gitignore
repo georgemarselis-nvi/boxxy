@@ -1,1 +1,5 @@
 /target
+/boxxy-report.txt
+/boxxy-dev.yaml
+/.env
+/release
