@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
+use eyre::eyre;
 use log::*;
 use nix::mount::{mount, MsFlags};
 
@@ -62,6 +63,19 @@ impl FsDriver {
 
     fn bind_mount(&self, src: &Path, target: &Path, flags: MsFlags) -> Result<()> {
         debug!("bind mount {src:?} onto {target:?}");
+
+        // Ensure that `src` and `target` are the same type of file, erroring if they aren't
+        if src.is_dir() && !target.is_dir() {
+            return Err(eyre!(
+                "Cannot bind mount a directory onto a file: {src:?} -> {target:?}"
+            ));
+        }
+        if src.is_file() && !target.is_file() {
+            return Err(eyre!(
+                "Cannot bind mount a file onto a directory: {src:?} -> {target:?}"
+            ));
+        }
+
         mount(
             Some(src),
             target,
@@ -74,7 +88,12 @@ impl FsDriver {
 
     pub fn touch(&self, path: &Path) -> Result<()> {
         debug!("touching {path:?}");
-        match OpenOptions::new().create(true).write(true).open(path) {
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -112,10 +131,7 @@ impl FsDriver {
 
     fn do_resolve_symlink(path: &Path, depth: u32) -> Result<PathBuf> {
         if depth > 10 {
-            return Err(color_eyre::eyre::eyre!(
-                "Too many symlinks when resolving path: {:?}",
-                path
-            ));
+            return Err(eyre!("Too many symlinks when resolving path: {:?}", path));
         }
 
         let path = if path.is_symlink() {

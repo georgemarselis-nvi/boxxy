@@ -1,8 +1,8 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use atty::Stream;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use color_eyre::Result;
 use log::*;
 use scanner::App;
@@ -69,6 +69,29 @@ pub struct Args {
     )]
     pub dotenv: bool,
 
+    #[arg(
+        long = "daemon",
+        default_value = "false",
+        help = "Fork to the background and run as a daemon."
+    )]
+    pub daemon: bool,
+
+    #[arg(
+        long = "no-config",
+        default_value = "false",
+        help = "Disable loading config files entirely.",
+        action = ArgAction::SetTrue
+    )]
+    pub no_config: bool,
+
+    #[arg(
+        short = 'r',
+        long = "rule",
+        help = "Pass rules via CLI. -r/--rule `/remount/this:/to/this:<file/directory>`",
+        action = ArgAction::Append
+    )]
+    pub arg_rules: Vec<String>,
+
     #[command(subcommand)]
     pub command: Option<BoxxySubcommand>,
 }
@@ -112,17 +135,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Load rules
-    let rules = {
-        let mut rules = vec![];
-        for config in BoxxyConfig::rule_paths()? {
-            info!("loading rules from {}", config.display());
-            rules.push(BoxxyConfig::load_rules_from_path(&config)?);
-        }
-        BoxxyConfig::merge(rules)
-    };
-    info!("loaded {} total rule(s)", rules.rules.len());
-
     // Do the thing!
     enclosure::Enclosure::new(BoxxyConfig::load_config(cfg)?).run()?;
 
@@ -142,7 +154,7 @@ fn setup_logging(cfg: &Args) -> Result<()> {
         std::env::set_var("RUST_LOG", &cfg.log_level);
     }
 
-    if atty::isnt(Stream::Stdout) && !cfg.force_colour {
+    if !std::io::stdout().is_terminal() && !cfg.force_colour {
         // Disable user-friendliness if we're not outputting to a terminal.
         std::env::set_var("NO_COLOR", "1");
         std::env::set_var("RUST_LOG", "warn");
@@ -207,7 +219,7 @@ fn scan_homedir(apps: Vec<App>) -> Result<()> {
         warn!("report bad rules!! https://github.com/queer/boxxy/issues/new");
         info!("rules generated: {}", rules.len());
         info!(
-            "put relevant rules in your config file: {}",
+            "you can put relevant rules in your config file located at: {}",
             BoxxyConfig::default_config_path()?.display()
         );
     }

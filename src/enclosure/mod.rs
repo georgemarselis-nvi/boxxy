@@ -9,9 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use color_eyre::Result;
+use daemonize::Daemonize;
 use dotenv_parser::parse_dotenv;
 use haikunator::Haikunator;
 use log::*;
+use nix::errno::Errno;
 use nix::mount::{umount2, MntFlags};
 use nix::sched::{clone, CloneFlags};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -64,7 +66,13 @@ impl Enclosure {
         self.set_up_temporary_files(applicable_rules)?;
 
         // Set up the container: callback, stack, etc.
-        let callback = || self.run_in_container(applicable_rules).unwrap();
+        let callback = || match self.run_in_container(applicable_rules) {
+            Ok(exit_code) => exit_code,
+            Err(err) => {
+                error!("{}", err);
+                -1isize
+            }
+        };
 
         let stack_size = match Resource::STACK.get() {
             Ok((soft, _hard)) => soft as usize,
@@ -78,12 +86,16 @@ impl Enclosure {
         let stack: &mut [u8] = stack_vec.as_mut_slice();
 
         // Clone off the container process
-        let pid = clone(
-            Box::new(callback),
-            stack,
-            CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER,
-            Some(nix::sys::signal::Signal::SIGCHLD as i32),
-        )?;
+        // SAFETY: we ask the OS for the right stack size, and failover to a
+        // safe, probably-oversized stack in case.
+        let pid = unsafe {
+            clone(
+                Box::new(callback),
+                stack,
+                CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER,
+                Some(nix::sys::signal::Signal::SIGCHLD as i32),
+            )?
+        };
         if pid.as_raw() == -1 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -147,8 +159,16 @@ impl Enclosure {
         if self.config.trace {
             self.run_with_tracing(pid)?;
         } else {
-            ptrace::detach(pid, None)?;
-            self.run_without_tracing(pid)?;
+            match ptrace::detach(pid, None) {
+                Ok(_) => {
+                    self.run_without_tracing(pid)?;
+                }
+                Err(Errno::ESRCH) => {
+                    error!("child exited early (ESRCH)! try running boxxy with `-l debug` or `-l trace` if it isn't obvious why");
+                    return Ok(());
+                }
+                err => return Ok(err?),
+            }
         }
 
         Ok(())
@@ -234,8 +254,8 @@ impl Enclosure {
 
             let rewrite_path = self.fs.fully_expand_path(&rule.rewrite)?;
 
-            debug!("ensuring path: {target_path:?}");
-            debug!("rewriting to: {rewrite_path:?}");
+            debug!("temp files: ensuring path: {target_path:?}");
+            debug!("temp files: rewriting to: {rewrite_path:?}");
 
             match rule.mode {
                 RuleMode::File => {
@@ -252,7 +272,7 @@ impl Enclosure {
                 }
             }
 
-            debug!("rewrote base bath {rewrite_path:?} => {target_path:?}");
+            debug!("temp files: rewrote base path {rewrite_path:?} => {target_path:?}");
         }
 
         Ok(vec![])
@@ -282,7 +302,7 @@ impl Enclosure {
                 debug!("loaded env var: {}=********", key);
             }
             if !rule.env.is_empty() {
-                info!(
+                debug!(
                     "loaded {} env vars from rule '{}'",
                     rule.env.len(),
                     rule.name
@@ -298,9 +318,9 @@ impl Enclosure {
         self.fs.bind_mount_rw(Path::new("/"), &container_root)?;
 
         // Apply all rules via bind mounts
-        info!("applying {} rules", applicable_rules.len());
+        debug!("applying {} rules", applicable_rules.len());
         for rule in applicable_rules {
-            info!("applying rule '{}'", rule.name);
+            debug!("applying rule '{}'", rule.name);
 
             let expanded_target = self.fs.fully_expand_path(&rule.target)?;
             // Rewrite target path into the container
@@ -316,8 +336,8 @@ impl Enclosure {
 
             let rewrite_path = self.fs.fully_expand_path(&rule.rewrite)?;
 
-            debug!("source exists: {}", rewrite_path.exists());
-            debug!("target exists: {}", target_path.exists());
+            debug!("rule apply: source exists: {}", rewrite_path.exists());
+            debug!("rule apply: target exists: {}", target_path.exists());
 
             // If the target file doesn't exist, we have to create it in order to bind mount over it.
             match rule.mode {
@@ -339,7 +359,7 @@ impl Enclosure {
                 }
             }
 
-            debug!("rewrote base bath {rewrite_path:?} => {target_path:?}");
+            debug!("rule apply: rewrote base path {rewrite_path:?} => {target_path:?}");
         }
 
         Ok(())
@@ -358,7 +378,7 @@ impl Enclosure {
             debug!("removing temporary file {}", file.display());
             std::fs::remove_file(file)?;
         }
-        for dir in &self.created_directories {
+        for dir in (&self.created_directories).iter().rev() {
             debug!("removing temporary directory {}", dir.display());
             std::fs::remove_dir(dir)?;
         }
@@ -367,6 +387,74 @@ impl Enclosure {
     }
 
     fn run_in_container(&mut self, applicable_rules: &[Rule]) -> Result<isize> {
+        // TODO: There HAS to be a better way than this...
+        let mut grep = grep::searcher::SearcherBuilder::new().build();
+
+        let path_to_input_binary = {
+            let program = self.config.command.get_program();
+            match which::which(program) {
+                Ok(path) => path,
+                Err(_) => {
+                    // Check if it's a path we can resolve
+                    let path = PathBuf::from(program);
+                    if path.exists() {
+                        path
+                    } else {
+                        return Err(eyre::eyre!("could not resolve binary: {program:?}"));
+                    }
+                }
+            }
+        };
+
+        // Search input binary for `--appimage-help` `--appimage-mount` and
+        // `--appimage-extract`.
+        // If it has all of these, it's PROBABLY an AppImage, and we should
+        // warn the end-user that they need to extract it first.
+        // TODO: Could we do this automatically?
+        let mut found_appimage_help = false;
+        let mut found_appimage_mount = false;
+        let mut found_appimage_extract = false;
+        let matcher = grep::regex::RegexMatcher::new(
+            r"(--appimage-help|--appimage-mount|--appimage-extract)",
+        )?;
+        grep.search_path(
+            matcher,
+            path_to_input_binary,
+            // TODO: Write a sink that doesn't care about line numbers and won't raise
+            grep::searcher::sinks::UTF8(|_, line| {
+                if line.contains("--appimage-help") {
+                    found_appimage_help = true;
+                } else if line.contains("--appimage-mount") {
+                    found_appimage_mount = true;
+                } else if line.contains("--appimage-extract") {
+                    found_appimage_extract = true;
+                }
+                Ok(true)
+            }),
+        )?;
+
+        // If the user is autoextracting the AppImage, we don't want to tell
+        // them to extract it first.
+        let mut self_extracting = false;
+        for arg in self.config.command.get_args() {
+            if arg == "--appimage-extract-and-run" {
+                info!(
+                    "self-extracting AppImages may take a while to extract! please be patient (:"
+                );
+                self_extracting = true;
+                debug!("self-extracting appimage detected!");
+                break;
+            }
+        }
+
+        if found_appimage_extract && found_appimage_help && found_appimage_mount && !self_extracting
+        {
+            return Err(eyre::eyre!(
+                "{program:?} is an AppImage! Please extract it first with --appimage-extract. You can also use --appimage-extract-and-run. For more information, see https://github.com/AppImage/AppImageKit/wiki/FUSE#fallback",
+                program = self.config.command.get_program()
+            ));
+        }
+
         self.set_up_container(applicable_rules)?;
 
         let pwd = std::env::current_dir()?;
@@ -396,18 +484,64 @@ impl Enclosure {
         ptrace::traceme()?;
         signal::kill(getpid(), signal::SIGSTOP)?;
 
-        // Do the needful!
+        // We have to set the child subreaper so that we can track
+        // grand-*children effectively. See https://github.com/queer/boxxy/issues/62
+        debug!("setting CHILD_SUBREAPER to {}", getpid());
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, getpid()) };
+
+        // Do the thing!
         debug!("running command: {:?}", self.config.command.get_program());
         info!(
             "{}",
             format!("boxed {:?} ♥", self.config.command.get_program())
                 .if_supports_color(owo_colors::Stream::Stdout, |text| text.fg::<PinkSalmon>())
         );
-        let result = self.config.command.spawn()?.wait()?;
 
-        debug!("command exited with status: {:?}", result);
+        debug!("and spawn!");
+        let child = self.config.command.spawn()?; // .wait()?;
 
-        Ok(result.code().map(|c| c as isize).unwrap_or(0isize))
+        debug!("checking daemonisation needs");
+        if self.config.daemon {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let stdout = File::create(format!("/tmp/boxxy-{now}.stdout"))?;
+            let stderr = File::create(format!("/tmp/boxxy-{now}.stderr"))?;
+
+            let out = Daemonize::new().stdout(stdout).stderr(stderr).execute();
+            if out.is_parent() {
+                info!("daemonized!");
+                info!("read logs from /tmp/boxxy-{now}.{{stdout,stderr}}.");
+                return Ok(0);
+            }
+        }
+
+        debug!("waiting for child exit...");
+        let child_exit_status = unsafe {
+            let mut exit_status = -1;
+            loop {
+                let mut wstatus = -1;
+                let wpid = libc::wait(&mut wstatus);
+                if wpid == -1 && Errno::last() != Errno::ECHILD {
+                    warn!("!!! NOT ECHLD");
+                    break;
+                }
+                if wpid == child.id() as i32 {
+                    debug!("primary child exited with status {wstatus}!");
+                    exit_status = wstatus;
+                }
+                if exit_status >= 0 && wpid == -1 {
+                    debug!("execution finished!");
+                    break;
+                }
+            }
+            exit_status
+        };
+
+        debug!("command exited with status: {:?}", child);
+
+        Ok(child_exit_status.try_into()?)
     }
 
     fn ensure_file(&self, path: &Path) -> Result<bool> {

@@ -23,6 +23,7 @@ fn get_fd_path(pid: Pid, fd: i32) -> Result<Option<PathBuf>> {
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct Syscall {
     pub name: String,

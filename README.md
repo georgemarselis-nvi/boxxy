@@ -1,25 +1,40 @@
 # boxxy
 
-boxxy is a tool for boxing up misbehaving Linux applications and forcing them
-to put their files and directories in the right place, **without symlinks!**
+boxxy (case-sensitive) is a tool for boxing up misbehaving Linux applications
+and forcing them to put their files and directories in the right place,
+**without symlinks!**
 
 boxxy is a part of the [amyware discord server](https://discord.gg/7WgSTwh).
 
+If you like what I make, consider supporting me on Patreon:
+
+[<img src="https://i.imgur.com/YFjoCd1.png" width="162" height="38" />](https://patreon.com/amyware)
+
 Linux-only! boxxy uses Linux namespaces for its functionality.
 
-For example, consider tmux. It wants to put its config in `~/.tmux.conf`. With
-boxxy, you can put its config in `~/.config/tmux/tmux.conf` instead:
+For example, consider the AWS CLI. It wants to store its config and credentials
+in `~/.aws/`, but boxxy lets you redirect it to `~/.config/aws/` instead:
 
 ```yaml
 # ~/.config/boxxy/boxxy.yaml
 rules:
-- name: "redirect tmux config from ~/.tmux.conf to ~/.config/tmux/tmux.conf"
-  target: "~/.tmux.conf"
-  rewrite: "~/.config/tmux/tmux.conf"
-  mode: "file"
+- name: "Store AWS CLI config in ~/.config/aws"
+  target: "~/.aws"
+  rewrite: "~/.config/aws"
 ```
 
-[![asciicast](https://asciinema.org/a/558679.svg)](https://asciinema.org/a/558679)
+boxxy lets you control where applications read and write files — whether that's
+for XDG compliance, project-specific configs, or any other path redirection you
+need. While some applications (like tmux 3.1+) have added native XDG support
+over time, many others haven't, and boxxy also enables more advanced use cases
+like context-dependent configurations that applications will never support
+natively.
+
+## maintenance status
+
+I am on a break from maintaining open-source projects due to health reasons.
+PRs will still be accepted and issues will still be looked at, but there are no
+promises about when this will happen.
 
 ## motivation
 
@@ -36,10 +51,15 @@ force it to puts its data somewhere nice and proper.
 - opt-in immutable fs outside of rule rewrites, ie only the files/directories
   you specify in rules are writable
 - `0.5.0`: boxxy can scan your homedir to automatically suggest rules for
-  you! ![image of boxxy scan](https://cdn.mewna.xyz/2023/03/25/G6hrd3iQjEy65.png)
+  you! ![image of boxxy scan](https://amyware.nyc3.digitaloceanspaces.com/2023/03/25/G6hrd3iQjEy65.png)
 - `0.6.0`: boxxy can use project-local `boxxy.yaml` files, and can load
-  `.env` files for you! ![image of 0.6.0 features](https://cdn.mewna.xyz/2023/03/28/Jawp5It1xrnWN.png)
-- `0.6.1`: boxxy rules can inject env vars: ![image of 0.6.1 features](https://cdn.mewna.xyz/2023/03/29/ukcWuiYdtI8yq.png)
+  `.env` files for you! ![image of 0.6.0 features](https://amyware.nyc3.digitaloceanspaces.com/2023/03/28/Jawp5It1xrnWN.png)
+- `0.6.1`: boxxy rules can inject env vars: ![image of 0.6.1 features](https://amyware.nyc3.digitaloceanspaces.com/2023/03/29/ukcWuiYdtI8yq.png)
+- `0.7.2`: boxxy can fork the boxxed process into the background with the
+  `--daemon` flag.
+- `0.8.0`: boxxy can pass rules at the command line with `--rule`, and disable
+  loading config files with `--no-config`.
+- `0.8.2`: Explain how to run AppImages properly: ![image of 0.8.2 features](https://amyware.nyc3.digitaloceanspaces.com/2023/10/31/yMiHJaURUud6E.png)
 
 ### potential drawbacks
 
@@ -82,6 +102,26 @@ git:(mistress) | ▶
 - dotfiles!
 - stop using symlinks!!!
 - no more dev config files when writing code
+
+## requirements
+
+boxxy requires `newuidmap` to function, which is not included by default in all
+distributions. To install:
+
+Alpine:
+```sh
+$ apk add shadow-uidmap
+```
+
+Debian / Ubuntu:
+```sh
+$ apt install uidmap
+```
+
+RHEL / Fedora:
+```sh
+$ yum install shadow-utils
+```
 
 ## configuration
 
@@ -149,3 +189,7 @@ rules:
 - bind-mount rule mounts rw so that target programs can use them
 - remount `/` ro
 - run!
+
+## credits
+
+- `fixtures/helloworld-appimage-x86_84.AppImage`: https://github.com/ClonedRepos/hello-world-appimage
